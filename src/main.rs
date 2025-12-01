@@ -4,7 +4,7 @@ use flate2::read::ZlibDecoder;
 use std::ffi::CStr;
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 
 /// Git directories.
 const GIT_DIR: &str = ".git";
@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
                 .expect("there is only one nul and that is at the end - this should not fail");
             let header = header.to_str().context("header is valid utf-8")?;
 
-            let Some((kind, size)) = header.split_once(' ') else {
+            let Some((kind, _)) = header.split_once(' ') else {
                 anyhow::bail!(
                     "corrupted {GIT_OBJECT_DIR}! header doesn't start with a known known kind: '{header}'"
                 )
@@ -96,31 +96,51 @@ fn main() -> anyhow::Result<()> {
                 )
             };
             let size = size
-                .parse::<usize>()
+                .parse::<u64>()
                 .context("failed to parse size: {size}")?;
 
-            buf.clear();
-            buf.resize(size, 0); // resize the buffer vector to the size of the file with 0 as each element (non-performant but meh for now)
-
-            zlib.read_exact(&mut buf[..])
-                .context("failed to read true contents of {GIT_OBJECT_DIR} file")?;
-            let n = zlib
-                .read(&mut [0])
-                .context("validate EOF in {GIT_OBJECT_DIR} file")?;
-            anyhow::ensure!(
-                n == 0,
-                "expected EOF in {GIT_OBJECT_DIR} file, had {n} trailing bytes"
-            );
-            let stdout = std::io::stdout();
-            let mut stdout = stdout.lock();
+            let mut zlib = LimitReader {
+                reader: zlib,
+                limit: size as usize,
+            };
 
             match kind {
-                Kind::Blob => stdout
-                    .write_all(&buf)
-                    .context("failed to write contents to stdout")?,
+                Kind::Blob => {
+                    let n = std::io::copy(&mut zlib, &mut buf)
+                        .context("write .git/objects file to stdout")?;
+                    anyhow::ensure!(
+                        n == size,
+                        "{GIT_OBJECT_DIR} was not expected size (expected: {size} actual: {n}"
+                    );
+                }
             }
         }
     }
 
     Ok(())
+}
+
+struct LimitReader<R> {
+    reader: R,
+    limit: usize,
+}
+
+impl<R> Read for LimitReader<R>
+where
+    R: Read,
+{
+    fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.len() > self.limit {
+            buf = &mut buf[..self.limit + 1];
+        }
+        let n = self.reader.read(buf)?;
+        if n > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "limit exceeded",
+            ));
+        }
+        self.limit -= n;
+        Ok(n)
+    }
 }
